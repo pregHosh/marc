@@ -1,15 +1,17 @@
 #!/usr/bin/env python
 
 import re
-from os.path import dirname, splitext
+from itertools import islice
+from os.path import basename, dirname, splitext
 
 import networkx as nx
 import numpy as np
 import scipy.spatial
 
+from navicat_marc.energies import HA_TO_KCAL, parse_title_energy
 from navicat_marc.exceptions import InputError
 
-ha_to_kcalmol = 627.509474
+ha_to_kcalmol = HA_TO_KCAL
 kcalmol_to_ha = 0.00159360143
 
 symbol_to_number = {
@@ -425,6 +427,32 @@ def b_eq(a, b):
     return np.isclose(a["distance"], b["distance"], rtol=0.05, atol=0.05)
 
 
+def parse_atom_line(line, where="the xyz block"):
+    """Atomic number and coordinates of an atom line: an element symbol or an atomic number, then x, y and z (any number
+    format float() reads, so integers are fine). Further columns are ignored."""
+    tokens = line.split()
+    if len(tokens) < 4:
+        raise InputError(f"Reading {where} failed: expected an element and three coordinates in {line.strip()!r}. Please check the format.")
+    element = tokens[0]
+    if element.isdigit():
+        number = int(element)
+        if number not in number_to_symbol:
+            raise InputError(f"Reading {where} failed: unknown atomic number {element} in {line.strip()!r}.")
+    else:
+        found = re.match(r"[A-Za-z]+", element)
+        symbol = found.group(0).capitalize() if found else element
+        if symbol not in symbol_to_number:
+            raise InputError(f"Reading {where} failed: unknown element {element!r} in {line.strip()!r}.")
+        number = symbol_to_number[symbol]
+    try:
+        xyz = np.array([float(t) for t in tokens[1:4]])
+    except ValueError:
+        raise InputError(f"Reading {where} failed: a coordinate is not a number in {line.strip()!r}.")
+    if not np.all(np.isfinite(xyz)):
+        raise InputError(f"Reading {where} failed: a coordinate is not finite in {line.strip()!r}.")
+    return number, xyz
+
+
 def center_coordinates(coordinates, atoms):
     coordinates = com(coordinates, atoms)
     for axidx in range(2):
@@ -455,7 +483,7 @@ class Molecule:
         self.radii = radii
         self.name = name
         if filename is not None:
-            self.name = splitext(filename)[0]
+            self.name = splitext(basename(filename))[0]
             self.from_file(filename, noh)
         elif lines is not None:
             self.from_lines(lines, noh)
@@ -472,186 +500,68 @@ class Molecule:
             self.set_graph()
 
     def from_file(self, filename, noh=True):
-        f = open(filename, "r")
-        V = list()
-        atoms = list()
-        n_atoms = 0
-
-        # Read the first line to obtain the number of atoms to read
+        """Reads the first structure of an xyz file."""
         try:
-            n_atoms = int(f.readline().strip())
-        except ValueError:
-            raise InputError(
-                f"Could not obtain the number of atoms in the .xyz file {filename} from first line. Please check format."
-            )
-
-        # The title line may contain an energy
-        title = f.readline().strip()
-        energy = None
-        posname = None
-        if "scf done:" in title and energy is None:
-            try:
-                etitle = title.replace(" ", "").split(":")[1].rstrip()
-                energy = float(etitle) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-        if "energy:" in title and energy is None:
-            try:
-                etitle = title.split(":")[1].split(" ")[1].rstrip()
-                energy = float(etitle) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-        if "Energy:" in title and energy is None:
-            try:
-                etitle = title.split(":")[1].strip()
-                energy = float(etitle)  # * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-        if "Eopt" in title and energy is None:
-            try:
-                etitle = title.split("Eopt")[-1].rstrip()
-                energy = float(etitle) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-            try:
-                posname = title.split(" ")[0].split("/")[-1].split(".")[-1].rstrip()
-            except Exception:
-                pass
-        if energy is None:
-            try:
-                energy = float(title) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-
-        # Use the number of atoms to not read beyond the end of a file
-        for lines_read, line in enumerate(f):
-            if lines_read == n_atoms:
-                break
-
-            atom = re.findall(r"[a-zA-Z]+", line)[0]
-            atom = symbol_to_number[atom]
-
-            numbers = re.findall(r"[-]?\d+\.\d*(?:[Ee][-\+]\d+)?", line)
-            numbers = [float(number) for number in numbers]
-
-            # The numbers are not valid unless we obtain exacly three
-            if len(numbers) == 3:
-                V.append(np.array(numbers))
-                atoms.append(atom)
-            else:
-                raise InputError(
-                    "Reading the .xyz file failed in line {0}. Please check the format.".format(
-                        lines_read + 2
+            with open(filename, "r") as f:
+                first = f.readline()
+                try:
+                    n_atoms = int(first.strip())
+                except ValueError:
+                    raise InputError(
+                        f"Could not obtain the number of atoms in the .xyz file {filename} from first line. Please check format."
                     )
-                )
-
-        f.close()
-        atoms = np.array(atoms, dtype=int)
-        V = center_coordinates(np.array(V), atoms)
-        self.title = title
-        self.coordinates_with_h = V
-        self.atoms_with_h = atoms
-        if noh:
-            self.atoms = atoms[np.where(atoms > 1)]
-            self.coordinates = V[np.where(atoms > 1)]
-        else:
-            self.atoms = atoms
-            self.coordinates = V
-        self.energy = energy
-        if self.name is None and self.name != posname:
-            self.name = posname
-        if self.radii is None and self.atoms is not None:
-            self.set_radii()
-        self.set_am()
-        self.set_graph()
+                lines = [first] + list(islice(f, max(n_atoms, 0) + 1))
+        except (OSError, UnicodeDecodeError) as e:
+            raise InputError(f"The xyz file {filename} could not be found or read: {e}")
+        self._read_structure(lines, noh, filename, strict=False)
 
     def from_lines(self, lines, noh=True):
+        """Reads one structure from the lines of an xyz block (atom count, title, atom lines)."""
+        lines = list(lines)
+        try:
+            n_atoms = int(lines[0].strip())
+        except (ValueError, IndexError):
+            raise InputError(
+                f"Could not obtain the number of atoms in the .xyz file line {lines[0] if lines else ''}. Please check format."
+            )
+        self._read_structure(lines, noh, "the xyz block starting with " + repr(lines[0].strip()))
+
+    def _read_structure(self, lines, noh, where, strict=True):
+        """The one reader of xyz blocks: single files and trajectory frames give the same atoms and the same energy.
+
+        The title line may hold an energy (see navicat_marc.energies for the recognised formats). An atom line is an
+        element symbol or an atomic number followed by three coordinates (integers are fine); further columns are
+        ignored. The title and the atom lines as they were read are kept for writing the structure back unchanged.
+
+        A structure with fewer atom lines than announced is refused when strict. A file read with Molecule(filename=...)
+        is not strict, as before: it keeps the atoms found and says so in self.truncated (the command line refuses it).
+        """
+        try:
+            n_atoms = int(lines[0].strip())
+        except (ValueError, IndexError):
+            raise InputError(f"Could not obtain the number of atoms in {where} from the first line. Please check format.")
+        if n_atoms < 1:
+            raise InputError(f"The number of atoms in {where} is {n_atoms}.")
+        if len(lines) < 2:
+            raise InputError(f"The structure in {where} has no title line.")
+        title = lines[1].strip()
+        body = [l.rstrip("\r\n") for l in lines[2 : 2 + n_atoms]]
+        self.truncated = None
+        if len(body) < n_atoms:
+            problem = f"{n_atoms} atoms are announced but {len(body)} atom lines were found"
+            if strict:
+                raise InputError(f"The structure in {where} is truncated: {problem}.")
+            self.truncated = problem
         V = list()
         atoms = list()
-        n_atoms = 0
-        lines_iter = iter(lines)
-
-        # Read the first line to obtain the number of atoms to read
-        try:
-            n_atoms = int(next(lines_iter).strip())
-        except ValueError:
-            raise InputError(
-                f"Could not obtain the number of atoms in the .xyz file line {lines[0]}. Please check format."
-            )
-
-        # The title line may contain an energy
-        title = next(lines_iter).strip()
-        energy = None
-        posname = None
-        if "energy:" in title and energy is None:
-            try:
-                etitle = title.split(":")[1].split(" ")[1].rstrip()
-                energy = float(etitle) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-        if "Energy:" in title and energy is None:
-            try:
-                etitle = title.split(":")[1].split(" ")[1].rstrip()
-                energy = float(etitle)  # * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-        if "Eopt" in title and energy is None:
-            try:
-                etitle = title.split("Eopt")[-1].rstrip()
-                energy = float(etitle) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-            try:
-                posname = title.split(" ")[0].split("/")[-1].split(".")[-1].rstrip()
-            except Exception:
-                pass
-        if energy is None:
-            try:
-                energy = float(title) * ha_to_kcalmol
-            except ValueError:
-                energy = None
-            except AttributeError:
-                energy = None
-
-        # Use the number of atoms to not read beyond the end of a file
-        for lines_read, line in enumerate(lines_iter):
-            if lines_read == n_atoms:
-                break
-
-            atom = re.findall(r"[a-zA-Z]+", line)[0]
-            atom = symbol_to_number[atom]
-
-            numbers = re.findall(r"[-]?\d+\.\d*(?:[Ee][-\+]\d+)?", line)
-            numbers = [float(number) for number in numbers]
-
-            # The numbers are not valid unless we obtain exacly three
-            if len(numbers) == 3:
-                V.append(np.array(numbers))
-                atoms.append(atom)
-            else:
-                raise InputError(
-                    f"Understanding the chunk of lines failed at line:\n {line}\nPlease check the format."
-                )
-
+        for lines_read, line in enumerate(body):
+            number, xyz = parse_atom_line(line, f"line {lines_read + 3} of {where}")
+            atoms.append(number)
+            V.append(xyz)
         atoms = np.array(atoms, dtype=int)
         V = center_coordinates(np.array(V), atoms)
         self.title = title
+        self.input_atom_lines = body
         self.coordinates_with_h = V
         self.atoms_with_h = atoms
         if noh:
@@ -660,9 +570,7 @@ class Molecule:
         else:
             self.atoms = atoms
             self.coordinates = V
-        self.energy = energy
-        if self.name is None and self.name != posname:
-            self.name = posname
+        self.energy, self.energy_source = parse_title_energy(title)
         if self.radii is None and self.atoms is not None:
             self.set_radii()
         self.set_am()
@@ -712,24 +620,29 @@ class Molecule:
         nx.set_edge_attributes(G, i2_dict, "idx_2")
         self.graph = G
 
-    def write(self, rootname="output"):
+    def write(self, rootname="output", keep_frame=False):
+        """Writes the structure to <rootname>.xyz with the title it was read with (the energy in Eh for a structure that
+        was not read from a file and has one). By default the coordinates are the centred and rotated ones used for the
+        comparison; with keep_frame the atom lines of the input are written unchanged."""
         filename = f"{rootname}.xyz"
-        f = open(filename, "w+")
-        with np.printoptions(
-            suppress=True, precision=6, formatter={"float_kind": "{:0.6f}".format}
-        ):
+        title = getattr(self, "title", None)
+        if title is None:
+            title = "" if self.energy is None else f"{np.round(self.energy * kcalmol_to_ha, decimals=6)}"
+        with open(filename, "w") as f:
             print(f"{len(self.atoms_with_h)}", file=f)
-            if self.energy is not None:
-                printable_energy = np.round(self.energy * kcalmol_to_ha, decimals=6)
-                print(f"{printable_energy}", file=f)
-            else:
-                print(f"{self.title}", file=f)
-            for i, atom in enumerate(self.atoms_with_h):
-                print(
-                    f"{number_to_symbol[atom]:2}    {np.round(self.coordinates_with_h[i][0],decimals=6): }    {np.round(self.coordinates_with_h[i][1],decimals=6): }    {np.round(self.coordinates_with_h[i][2],decimals=6): }",
-                    file=f,
-                )
-        f.close()
+            print(f"{title}", file=f)
+            if keep_frame and getattr(self, "input_atom_lines", None):
+                for line in self.input_atom_lines:
+                    print(line, file=f)
+                return
+            with np.printoptions(
+                suppress=True, precision=6, formatter={"float_kind": "{:0.6f}".format}
+            ):
+                for i, atom in enumerate(self.atoms_with_h):
+                    print(
+                        f"{number_to_symbol[atom]:2}    {np.round(self.coordinates_with_h[i][0],decimals=6): }    {np.round(self.coordinates_with_h[i][1],decimals=6): }    {np.round(self.coordinates_with_h[i][2],decimals=6): }",
+                        file=f,
+                    )
 
     def update(self, atoms, coordinates):
         self.atoms = atoms

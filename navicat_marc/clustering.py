@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import os
+
 import matplotlib
 import numpy as np
 
@@ -21,7 +23,7 @@ from navicat_marc.exceptions import UniqueError
 ref_percentages = [0.01, 0.5]
 
 
-def plot_dendrogram(m: np.ndarray, label: str, verb=0):
+def plot_dendrogram(m: np.ndarray, label: str, verb=0, outdir=None):
     if verb > 0:
         print(f"Max pairwise {label}: {np.max(m)} in {label} units.")
         if verb > 2:
@@ -33,8 +35,8 @@ def plot_dendrogram(m: np.ndarray, label: str, verb=0):
         linkage, no_labels=True, count_sort="descendent"
     )
     if verb > 0:
-        print(f"Saving dendrogram plot as {label}_dendrogram.png in working directory.")
-    plt.savefig(f"{label}_dendrogram.png")
+        print(f"Saving dendrogram plot as {label}_dendrogram.png in the output directory.")
+    plt.savefig(os.path.join(outdir or ".", f"{label}_dendrogram.png"))
     plt.close()
 
 
@@ -51,7 +53,7 @@ def beautify_ax(ax):
     return ax
 
 
-def plot_tsne(m: np.ndarray, points, clusters, names):
+def plot_tsne(m: np.ndarray, points, clusters, names, outdir=None):
     val = np.min(m)
     if val < 0:
         m += -val
@@ -130,7 +132,7 @@ def plot_tsne(m: np.ndarray, points, clusters, names):
             marker="X",
             label=f"{names[index]}",
         )
-    plt.savefig("tsne_plot.png", bbox_inches="tight")
+    plt.savefig(os.path.join(outdir or ".", "tsne_plot.png"), bbox_inches="tight")
     box = ax.get_position()
     ax.set_position([box.x0, box.y0 + box.height * 0.1, box.width, box.height * 0.9])
     ax.legend(
@@ -140,18 +142,20 @@ def plot_tsne(m: np.ndarray, points, clusters, names):
         shadow=True,
         ncol=min(len(clusters), 10),
     )
-    plt.savefig("tsne_plot_legend.png", bbox_inches="tight")
+    plt.savefig(os.path.join(outdir or ".", "tsne_plot_legend.png"), bbox_inches="tight")
     plt.close()
 
 
-def kmeans_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
+def kmeans_clustering(n_clusters, m: np.ndarray, rank=5, verb=0, seed=None, outdir=None, info=None):
+    """info, if a dict is given, receives how the number of clusters was chosen when n_clusters is None:
+    method, scores (per candidate number of clusters) and k_chosen. outdir is where fm.npy is saved."""
     mds = MDS(
         dissimilarity="precomputed",
         n_components=rank,
         n_init=1,
         max_iter=500,
         normalized_stress="auto",
-        random_state=42,
+        random_state=42 if seed is None else seed,
     )
     x = mds.fit_transform(m)
 
@@ -160,9 +164,9 @@ def kmeans_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
         with np.printoptions(threshold=np.inf):
             print(np.array_str(x, precision=2, suppress_small=True))
         print(
-            f"Writing feature matrix (with full precision) to fm.npy in the working directory."
+            f"Writing feature matrix (with full precision) to fm.npy in the output directory."
         )
-        np.save("fm.npy", x)
+        np.save(os.path.join(outdir or ".", "fm.npy"), x)
 
     if n_clusters is None:
         nm = m.shape[0]
@@ -178,10 +182,14 @@ def kmeans_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
         if len(percentages) == 1:
             n_clusters = 2
         else:
-            id_gap = gap(x, nrefs=min(nm, 5), ks=percentages, verb=verb)
+            id_gap = gap(x, nrefs=min(nm, 5), ks=percentages, verb=verb, seed=seed, info=info)
             n_clusters = percentages[id_gap]
         n_unique, rank = unique_nr(m, verb=verb)
         n_clusters = int(min(n_unique, n_clusters))
+        if info is not None:
+            info["k_chosen"] = n_clusters
+            info.setdefault("method", "default")
+            info.setdefault("scores", {})
     centroids = naive_sharding(x, n_clusters)
     km = KMeans(n_clusters=n_clusters, n_init=1, init=centroids)
     cm = km.fit_predict(x)
@@ -213,9 +221,9 @@ def kmeans_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
     return closest_pt_idx, clusters
 
 
-def affprop_clustering(m, verb=0):
+def affprop_clustering(m, verb=0, seed=None):
     m = np.ones_like(m) - m
-    ap = AffinityPropagation(affinity="precomputed")
+    ap = AffinityPropagation(affinity="precomputed", random_state=seed)
     cm = ap.fit_predict(m)
     u, c = np.unique(cm, return_counts=True)
     closest_pt_idx = []
@@ -240,13 +248,15 @@ def affprop_clustering(m, verb=0):
     return closest_pt_idx, clusters
 
 
-def agglomerative_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
+def agglomerative_clustering(n_clusters, m: np.ndarray, rank=5, verb=0, seed=None, outdir=None, info=None):
+    """info receives how the number of clusters was chosen, as for kmeans_clustering."""
     if n_clusters is None:
         mds = MDS(
             dissimilarity="precomputed",
             n_components=rank,
             n_init=10,
             normalized_stress="auto",
+            random_state=seed,
         )
         x = mds.fit_transform(m)
         nm = m.shape[0]
@@ -262,10 +272,14 @@ def agglomerative_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
         if len(percentages) == 1:
             n_clusters = 2
         else:
-            id_gap = gap(x, nrefs=min(nm, 5), ks=percentages, verb=verb)
+            id_gap = gap(x, nrefs=min(nm, 5), ks=percentages, verb=verb, seed=seed, info=info)
             n_clusters = percentages[id_gap]
         n_unique, rank = unique_nr(m, verb=verb)
         n_clusters = min(n_unique, n_clusters)
+        if info is not None:
+            info["k_chosen"] = int(n_clusters)
+            info.setdefault("method", "default")
+            info.setdefault("scores", {})
     if n_clusters < 2:
         raise UniqueError(
             "Agglomerative clustering requires at least 2 clusters. Currently it seems like your data only has 1 cluster, either by mistake or by request."
@@ -306,14 +320,18 @@ def agglomerative_clustering(n_clusters, m: np.ndarray, rank=5, verb=0):
     return closest_pt_idx, clusters
 
 
-def finder(data, refs=None, nrefs=10, ks=range(1, 11), choice="silhouette", verb=0):
+def finder(
+    data, refs=None, nrefs=10, ks=range(1, 11), choice="silhouette", verb=0, seed=None
+):
     shape = data.shape
+    # With a seed, the reference data of the gap statistic and its k-means runs are reproducible.
+    rng = np.random if seed is None else np.random.RandomState(seed)
     if refs is None:
         tops = data.max(axis=0)
         bots = data.min(axis=0)
         dists = np.diag((tops - bots))
         # dists = scipy.matrix(scipy.diag(tops - bots))
-        rands = np.random.random_sample(size=(shape[0], shape[1], nrefs))
+        rands = rng.random_sample(size=(shape[0], shape[1], nrefs))
         for i in range(nrefs):
             rands[:, :, i] = rands[:, :, i]@ dists + bots
     else:
@@ -395,7 +413,7 @@ def finder(data, refs=None, nrefs=10, ks=range(1, 11), choice="silhouette", verb
             refdisps = np.zeros((rands.shape[2],))
             for j in range(rands.shape[2]):
                 centroids = naive_sharding(rands[:, :, j], n_clusters=k)
-                km = KMeans(n_clusters=k, n_init=1)
+                km = KMeans(n_clusters=k, n_init=1, random_state=seed)
                 _ = km.fit_predict(rands[:, :, j])
                 kmc = km.cluster_centers_
                 kml = km.labels_
@@ -429,21 +447,33 @@ def finder(data, refs=None, nrefs=10, ks=range(1, 11), choice="silhouette", verb
     return diff, sc, bick
 
 
-def gap(data, refs=None, nrefs=5, ks=range(1, 11), choice="silhouette", verb=0):
-    diff, sc, bick = finder(data, refs, nrefs, ks, choice, verb)
+def gap(data, refs=None, nrefs=5, ks=range(1, 11), choice="silhouette", verb=0, seed=None, info=None):
+    diff, sc, bick = finder(data, refs, nrefs, ks, choice, verb, seed)
+
+    if info is not None:
+        # What was scored, per candidate number of clusters, for the record of the run.
+        info["method"] = choice
+        if choice == "silhouette":
+            info["scores"] = {str(k): float(v) for k, v in zip(ks, sc)}
+        elif choice == "gap":
+            info["scores"] = {str(k): float(v) for k, v in zip(ks, diff)}
+        else:
+            info["scores"] = {str(k): float(v) for k, v in zip(ks, bick)}
 
     if choice == "gap":
-        best = np.argmax(diff > 0) - 1
+        # Smallest k whose gap is within one standard error of the next one; the largest k if none is.
+        best = int(np.argmax(diff > 0)) if np.any(diff > 0) else len(ks) - 1
         if best == 0:
             print(
                 "The number of clusters according to the gap statistic is 1! Your structures and energies all must be very similar!"
             )
 
     if choice == "silhouette":
-        best = np.argmax(sc) - 1
-        if best == 0:
+        # The index of the best silhouette score is the index of its k in ks.
+        best = int(np.argmax(sc))
+        if best == 0 and ks[0] == 1:
             print(
-                "The number of clusters according to the gap statistic is 1! Your structures and energies all must be very similar!"
+                "The number of clusters with the best silhouette score is 1! Your structures and energies all must be very similar!"
             )
 
     if choice == "bic":
